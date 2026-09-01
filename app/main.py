@@ -55,7 +55,9 @@ def main():
 
     chain = prompt | llm | StrOutputParser()
 
-    print(chain.invoke({"question": args.p}))
+    for chunk in chain.stream({"question": args.p}):
+        print(chunk, end="", flush=True)
+    print()
 
 
 if __name__ == "__main__":
