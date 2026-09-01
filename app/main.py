@@ -1,14 +1,32 @@
 import os
 import sys
 import argparse
-from openai import OpenAI
 
-from dotenv import load_dotenv
-load_dotenv()
+# https://docs.langchain.com/oss/python/integrations/chat/
+
+from langchain_openai import AzureChatOpenAI
+from langchain_openai import ChatOpenAI
+# from langchain_google_vertexai import ChatVertexAI
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_anthropic import ChatAnthropic
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_ollama import ChatOllama
+from databricks_langchain import ChatDatabricks
+from langchain_groq import ChatGroq
+from langchain_litellm import ChatLiteLLM
+from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
+from langchain_mistralai import ChatMistralAI
+from langchain_openrouter import ChatOpenRouter
+from langchain_cohere import ChatCohere
+from langchain_xai import ChatXAI
+from langchain_nvidia_ai_endpoints import ChatNVIDIA
+from langchain_deepseek import ChatDeepSeek
+from langchain_together import ChatTogether
+from langchain_amazon_nova import ChatAmazonNova
 
 
-API_KEY = os.getenv("OPENROUTER_API_KEY")
-BASE_URL = os.getenv("OPENROUTER_BASE_URL", default="https://openrouter.ai/api/v1")
+# from dotenv import load_dotenv
+# load_dotenv()
 
 
 
@@ -17,10 +35,6 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("-p", required=True)
     args = p.parse_args()
-   
-
-    if not API_KEY:
-        print("Error: OPENROUTER_API_KEY is not set in the environment variables.")
 
     
 
