@@ -4,6 +4,8 @@ import argparse
 import subprocess
 
 import httpx
+from bs4 import BeautifulSoup
+from ddgs import DDGS
 
 # https://docs.langchain.com/oss/python/integrations/chat/
 from langchain_ollama import ChatOllama
@@ -29,9 +31,8 @@ from langchain_ollama import ChatOllama
 # from langchain_amazon_nova import ChatAmazonNova
 
 
-from dotenv import load_dotenv
-
-load_dotenv()
+# from dotenv import load_dotenv
+# load_dotenv()
 
 from langchain.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate
@@ -55,9 +56,13 @@ DEFAULT_LIMIT = 20000
 MAX_OUTPUT_CHARS = 30000
 DEFAULT_TIMEOUT = 60
 
-# https://context7.com — up-to-date docs pulled from each library's own source.
-CONTEXT7_BASE_URL = "https://context7.com/api/v1"
-DEFAULT_DOC_TOKENS = 3000
+# Web search backing search_docs. No API key — DuckDuckGo via ddgs.
+SEARCH_RESULTS = 5
+FETCH_PAGES = 2
+MAX_PAGE_CHARS = 6000
+MIN_PAGE_CHARS = 200
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) karigor/0.1"
+CONTENT_SELECTORS = ("main", "article", "[role=main]", "#content", ".markdown")
 LLM_MODEL="gemma4:e2b"
 # LLM_MODEL="qwen3:8b"
 # Ollama defaults to a 4096-token context, which a single tool result fills —
@@ -186,97 +191,103 @@ def bash(command: str, timeout: int = DEFAULT_TIMEOUT) -> str:
     return output
 
 
-def _slug(name: str) -> str:
-    """Lowercase, alphanumerics only — so "Next.js" and "nextjs" compare equal."""
-    return "".join(ch for ch in name.lower() if ch.isalnum())
-
-
-def _context7_get(path: str, params: dict, accept_text: bool = False):
-    """GET against the Context7 API. Returns parsed JSON, text, or an error string."""
-    key = os.environ.get("CONTEXT7_API_KEY")
-    if not key:
-        return "Error: CONTEXT7_API_KEY is not set (see .env.example)"
-
+def _fetch_text(url: str) -> str:
+    """Fetch a page and strip it down to readable text, or return an error string."""
     try:
         r = httpx.get(
-            f"{CONTEXT7_BASE_URL}{path}",
-            params=params,
-            headers={"Authorization": f"Bearer {key}"},
-            timeout=30.0,
+            url,
+            follow_redirects=True,
+            timeout=20.0,
+            headers={"User-Agent": USER_AGENT},
         )
         r.raise_for_status()
     except httpx.HTTPStatusError as e:
-        return f"Error: Context7 returned {e.response.status_code} for {path}"
+        return f"Error: {e.response.status_code} fetching {url}"
     except httpx.HTTPError as e:
-        return f"Error: could not reach Context7: {e}"
+        return f"Error: could not fetch {url}: {e}"
 
-    return r.text if accept_text else r.json()
+    soup = BeautifulSoup(r.text, "html.parser")
+    # Nav chrome and scripts are pure noise once the page is flattened to text.
+    for junk in soup(["script", "style", "nav", "header", "footer", "noscript"]):
+        junk.decompose()
+
+    # Prefer the page's main content region. Sidebars are rarely marked up as
+    # <nav>, so flattening the whole body buries the docs under link lists.
+    candidates = [soup.select_one(sel) for sel in CONTENT_SELECTORS]
+    candidates.append(soup.body or soup)
+    best = max((c for c in candidates if c), key=lambda c: len(c.get_text()))
+
+    # Walk block elements rather than flattening everything: get_text() on a
+    # whole page puts every inline span on its own line, which shreds both
+    # prose and code. <pre> keeps its newlines; everything else gets reflowed.
+    blocks = []
+    for el in best.find_all(["h1", "h2", "h3", "h4", "p", "li", "pre"]):
+        if el.name == "pre":
+            code = el.get_text().strip()
+            if code:
+                blocks.append(f"```\n{code}\n```")
+            continue
+
+        text = " ".join(el.get_text(" ", strip=True).split())
+        # Sidebar entries survive as short <li>s ("Vector stores"); real list
+        # content in docs is a sentence or close to it.
+        if not text or (el.name == "li" and len(text.split()) < 5):
+            continue
+        if not blocks or blocks[-1] != text:
+            blocks.append(text)
+
+    return "\n\n".join(blocks)
 
 
 @tool
 def search_docs(library: str, query: str, version: str = "") -> str:
     """Look up current documentation and code examples for a library or framework.
 
-    Fetches docs straight from the library's own source, so the answer
-    reflects the released version rather than model memory. Use this for
-    any question about a library, framework, SDK, or CLI tool — API syntax,
-    configuration, setup, or migration.
+    Searches the web and reads the top documentation pages, so the answer
+    comes from the docs as they are published today rather than from model
+    memory. Use this for any question about a library, framework, SDK, or
+    CLI tool — API syntax, configuration, setup, or migration.
 
     Args:
         library: Library name, e.g. "LangChain", "Next.js", "Prisma".
         query: What to look up, as a phrase — "how to define a custom tool",
             not a single word. Keep it to one concept per call.
-        version: Optional version to pin, e.g. "v14.3.0". Omit for latest.
+        version: Optional version to bias the search, e.g. "v14". Search
+            results are whatever the web serves, so this is a hint, not a pin.
     """
-    found = _context7_get("/search", {"query": library})
-    if isinstance(found, str):
-        return found
+    terms = " ".join(t for t in [library, version, query, "documentation"] if t)
 
-    results = found.get("results") or []
+    try:
+        results = DDGS().text(terms, max_results=SEARCH_RESULTS)
+    except Exception as e:  # ddgs raises its own error types for rate limits
+        return f"Error: search failed for {terms!r}: {e}"
+
     if not results:
-        return f"No library named {library!r} found on Context7"
+        return f"No search results for {terms!r}"
 
-    # Search is fuzzy and always answers, so a nonsense name still comes back
-    # with something unrelated. Keep only titles that actually match the name
-    # asked for, then let quality decide between them — the raw relevance
-    # score is not comparable across queries.
-    wanted = _slug(library)
-    titles = [(r, _slug(r.get("title", ""))) for r in results]
-    # Exact title first: a prefix match alone pulls in "LangChain NVIDIA" for
-    # "LangChain", and those sub-projects often outrank the real docs.
-    matches = [r for r, t in titles if t == wanted]
-    if not matches:
-        matches = [r for r, t in titles if t.startswith(wanted)]
-    if not matches:
-        close = ", ".join(f"{r.get('title')} ({r['id']})" for r in results[:3])
-        return f"No confident match for {library!r} on Context7. Closest: {close}"
+    out = [f"Search: {terms}"]
+    for i, hit in enumerate(results, start=1):
+        title = hit.get("title", "")
+        url = hit.get("href", "")
+        out.append(f"\n{i}. {title}\n   {url}")
 
-    best = max(
-        matches,
-        key=lambda r: (r.get("benchmarkScore") or 0, r.get("trustScore") or 0),
-    )
-    library_id = best["id"]
+        # Only the top few pages are worth the round trip; the rest stay as
+        # the search snippet so the model can ask for one by name.
+        snippet = hit.get("body", "")
+        if i <= FETCH_PAGES:
+            body = _fetch_text(url)
+            # Client-rendered doc sites return a shell with no prose in it;
+            # the search snippet is then the more useful of the two.
+            if body.startswith("Error:") or len(body) < MIN_PAGE_CHARS:
+                body = snippet or body
+        else:
+            body = snippet
 
-    if version:
-        available = [v for v in best.get("versions") or [] if version in v]
-        if not available:
-            return (
-                f"Version {version!r} is not available for {library_id}. "
-                f"Known versions: {', '.join(best.get('versions') or []) or 'none'}"
-            )
-        library_id = f"{library_id}/{available[0]}"
+        if len(body) > MAX_PAGE_CHARS:
+            body = body[:MAX_PAGE_CHARS] + "\n... [truncated]"
+        out.append(body)
 
-    docs = _context7_get(
-        f"/{library_id.lstrip('/')}",
-        {"type": "txt", "topic": query, "tokens": DEFAULT_DOC_TOKENS},
-        accept_text=True,
-    )
-    if docs.startswith("Error:"):
-        return docs
-    if not docs.strip():
-        return f"No documentation found in {library_id} for {query!r}"
-
-    return f"Docs for {best.get('title', library)} ({library_id}):\n\n{docs.strip()}"
+    return "\n".join(out)
 
 
 TOOLS = {t.name: t for t in [read_file, write_file, bash, search_docs]}
