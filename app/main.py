@@ -68,6 +68,7 @@ LLM_MODEL="gemma4:e2b"
 # Ollama defaults to a 4096-token context, which a single tool result fills —
 # the model then has no room left to answer and returns empty text.
 NUM_CTX = 32768
+MAX_TURNS = 25
 
 
 @tool
@@ -293,6 +294,22 @@ def search_docs(library: str, query: str, version: str = "") -> str:
 TOOLS = {t.name: t for t in [read_file, write_file, bash, search_docs]}
 
 
+def _stream_turn(llm, messages):
+    """Run one assistant turn, printing text as it arrives.
+
+    Returns the accumulated message. Summing the streamed chunks rebuilds
+    the tool calls too, so the loop can stream and still see what to run.
+    """
+    full = None
+    for chunk in llm.stream(messages):
+        if chunk.text:
+            print(chunk.text, end="", flush=True)
+        full = chunk if full is None else full + chunk
+    if full is not None and full.text:
+        print()
+    return full
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("-p", required=True)
@@ -311,33 +328,36 @@ def main():
         HumanMessage(args.p),
     ]
 
-    ai_msg = llm_with_tools.invoke(messages)
-    messages.append(ai_msg)
+    # The agent loop: keep going until the model answers without asking for a
+    # tool. One pass only ever gets one step done — "read this file and fix the
+    # bug" needs the model to see the read before it can write.
+    for _ in range(MAX_TURNS):
+        ai_msg = _stream_turn(llm_with_tools, messages)
+        messages.append(ai_msg)
 
-    if not ai_msg.tool_calls:
-        # The model answered directly; nothing to execute.
-        print(ai_msg.text)
-        return
+        if not ai_msg.tool_calls:
+            # No call requested, so this was the final answer.
+            return
 
-    # Execute: the model only *asks* for a call — we run it and hand back the result.
-    for call in ai_msg.tool_calls:
-        print(f"[{call['name']}({call['args']})]", flush=True)
-        tool = TOOLS.get(call["name"])
-        if tool is None:
-            messages.append(
-                ToolMessage(
-                    content=f"Error: unknown tool {call['name']}",
-                    tool_call_id=call["id"],
+        # Execute: the model only *asks* for a call — we run it and hand back
+        # the result, then loop so it can act on what it just learned.
+        for call in ai_msg.tool_calls:
+            print(f"[{call['name']}({call['args']})]", flush=True)
+            tool = TOOLS.get(call["name"])
+            if tool is None:
+                messages.append(
+                    ToolMessage(
+                        content=f"Error: unknown tool {call['name']}",
+                        tool_call_id=call["id"],
+                    )
                 )
-            )
-            continue
-        # .invoke() on the whole tool_call returns a ToolMessage with the id set.
-        messages.append(tool.invoke(call))
+                continue
+            # .invoke() on the whole tool_call returns a ToolMessage with the id set.
+            messages.append(tool.invoke(call))
 
-    # One more turn so the model can answer from the tool output.
-    for chunk in llm_with_tools.stream(messages):
-        print(chunk.text, end="", flush=True)
-    print()
+    # A model that keeps calling tools without concluding would otherwise spin
+    # here forever, burning tokens and touching the filesystem each time.
+    print(f"[stopped after {MAX_TURNS} turns]", file=sys.stderr)
 
 
 if __name__ == "__main__":
