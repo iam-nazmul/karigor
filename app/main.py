@@ -63,6 +63,12 @@ MAX_PAGE_CHARS = 6000
 MIN_PAGE_CHARS = 200
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) karigor/0.1"
 CONTENT_SELECTORS = ("main", "article", "[role=main]", "#content", ".markdown")
+
+# browse fetches one URL the model names, so it gets its own budget: a page read
+# on purpose is worth more room than one of several search hits.
+MAX_BROWSE_CHARS = 30000
+BROWSE_TIMEOUT = 30.0
+TEXTUAL_TYPES = ("text/", "json", "xml", "javascript", "csv", "yaml", "x-sh")
 LLM_MODEL="gemma4:e2b"
 # LLM_MODEL="qwen3:8b"
 # Ollama defaults to a 4096-token context, which a single tool result fills —
@@ -192,22 +198,26 @@ def bash(command: str, timeout: int = DEFAULT_TIMEOUT) -> str:
     return output
 
 
-def _fetch_text(url: str) -> str:
-    """Fetch a page and strip it down to readable text, or return an error string."""
+def _get(url: str, timeout: float):
+    """GET a URL. Returns (response, None) or (None, error string)."""
     try:
         r = httpx.get(
             url,
             follow_redirects=True,
-            timeout=20.0,
+            timeout=timeout,
             headers={"User-Agent": USER_AGENT},
         )
         r.raise_for_status()
     except httpx.HTTPStatusError as e:
-        return f"Error: {e.response.status_code} fetching {url}"
+        return None, f"Error: {e.response.status_code} fetching {url}"
     except httpx.HTTPError as e:
-        return f"Error: could not fetch {url}: {e}"
+        return None, f"Error: could not fetch {url}: {e}"
+    return r, None
 
-    soup = BeautifulSoup(r.text, "html.parser")
+
+def _extract_text(html: str) -> str:
+    """Strip an HTML document down to its readable text."""
+    soup = BeautifulSoup(html, "html.parser")
     # Nav chrome and scripts are pure noise once the page is flattened to text.
     for junk in soup(["script", "style", "nav", "header", "footer", "noscript"]):
         junk.decompose()
@@ -238,6 +248,80 @@ def _fetch_text(url: str) -> str:
             blocks.append(text)
 
     return "\n\n".join(blocks)
+
+
+def _fetch_text(url: str) -> str:
+    """Fetch a page and strip it down to readable text, or return an error string."""
+    r, err = _get(url, timeout=20.0)
+    if err:
+        return err
+    return _extract_text(r.text)
+
+
+@tool
+def browse(url: str, offset: int = 0, limit: int = MAX_BROWSE_CHARS) -> str:
+    """Fetch a URL over the internet and return its content as text.
+
+    Use this to read a page whose address you already have: release notes, a
+    GitHub issue or raw file, a JSON API response, a link that came back from
+    search_docs. Use search_docs instead when you still need to find the page.
+
+    HTML is stripped to its main content — headings, paragraphs, list items and
+    code blocks. JSON, plain text and other textual bodies are returned as sent.
+    Long pages are truncated; call again with a larger offset to read on.
+
+    Args:
+        url: The URL to fetch. http and https only; a bare domain is read as https.
+        offset: Character offset to start from, for paging through a long page.
+        limit: Maximum number of characters to return.
+    """
+    url = url.strip()
+    if not url:
+        return "Error: no url given"
+    if "://" not in url:
+        url = "https://" + url
+
+    scheme = url.split("://", 1)[0].lower()
+    # Anything else — file://, data://, ftp:// — is either a local read the
+    # read_file tool already does or something this tool has no business doing.
+    if scheme not in ("http", "https"):
+        return f"Error: unsupported scheme {scheme!r}; browse handles http and https"
+
+    r, err = _get(url, timeout=BROWSE_TIMEOUT)
+    if err:
+        return err
+
+    content_type = r.headers.get("content-type", "").split(";")[0].strip().lower()
+
+    if "html" in content_type or not content_type:
+        body = _extract_text(r.text)
+        # A client-rendered page is a shell with no prose in it. Saying so beats
+        # returning nothing, which reads as "the page is empty".
+        if not body:
+            return (
+                f"{url}\n({content_type or 'unknown type'}, no readable text — the page "
+                "likely renders its content with JavaScript)"
+            )
+    elif any(t in content_type for t in TEXTUAL_TYPES):
+        body = r.text
+    else:
+        return (
+            f"Error: {url} is {content_type} ({len(r.content)} bytes), not text. "
+            "Use bash with curl if you need to download it."
+        )
+
+    header = f"{url}\n({content_type or 'unknown type'}, {len(body)} chars)"
+
+    start = max(offset, 0)
+    if start >= len(body):
+        return f"{header}\nError: offset {offset} is past the end of the content"
+    end = min(start + max(limit, 1), len(body))
+
+    out = body[start:end]
+    if end < len(body):
+        out += f"\n... [truncated, {len(body) - end} more chars; continue with offset={end}]"
+
+    return f"{header}\n\n{out}"
 
 
 @tool
@@ -291,7 +375,7 @@ def search_docs(library: str, query: str, version: str = "") -> str:
     return "\n".join(out)
 
 
-TOOLS = {t.name: t for t in [read_file, write_file, bash, search_docs]}
+TOOLS = {t.name: t for t in [read_file, write_file, bash, search_docs, browse]}
 
 
 def _stream_turn(llm, messages):

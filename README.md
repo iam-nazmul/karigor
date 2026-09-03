@@ -196,7 +196,7 @@ Adding it to the program is one line — `TOOLS` is a name→tool registry, and 
 dispatch loop from step 4 picks up anything in it unchanged:
 
 ```python
-TOOLS = {t.name: t for t in [read_file, write_file, bash, search_docs]}
+TOOLS = {t.name: t for t in [read_file, write_file, bash, search_docs, browse]}
 ```
 
 ## 7. Implement the bash tool
@@ -244,11 +244,50 @@ Two limits worth knowing: `version` biases the search but cannot pin it, and web
 search always answers — a misspelled library name returns something confident and
 unrelated rather than an error.
 
+## 9. Implement the browse tool
+
+`search_docs` finds pages; `browse` reads one you already have the address for —
+a release-note page, a GitHub issue, a raw file, a JSON endpoint, or a link that
+came back from a search:
+
+```python
+@tool
+def browse(url: str, offset: int = 0, limit: int = MAX_BROWSE_CHARS) -> str:
+    """Fetch a URL over the internet and return its content as text. ..."""
+```
+
+The HTML extraction is the same code `search_docs` uses — `_fetch_text` was split
+into `_get` (fetch, with HTTP errors returned as strings) and `_extract_text`
+(soup to blocks), and both tools compose them. What `browse` adds is the handling
+a single named URL needs:
+
+- **Content types.** HTML goes through the extractor; JSON, plain text, XML, CSV
+  and friends are returned verbatim, since running a JSON body through an HTML
+  parser yields nothing. Anything else — an image, a tarball — reports its type
+  and size instead of dumping bytes into the context window.
+- **Paging.** A page over `MAX_BROWSE_CHARS` is cut with
+  `continue with offset=N`, so a long document is readable across calls rather
+  than silently ending mid-sentence.
+- **Scheme check.** `http`/`https` only. A bare domain gets `https://` prepended;
+  `file://` is refused, because that is `read_file`'s job.
+- **Empty pages.** A client-rendered site extracts to nothing, which reads as "the
+  page is empty" — it says the content is JavaScript-rendered instead.
+
+```
+$ uv run karigor -p "Browse https://example.com and tell me what that domain is for."
+[browse({'url': 'https://example.com'})]
+It's a reserved domain for use in documentation examples, no permission needed.
+```
+
+`browse` fetches whatever URL the model asks for, including addresses it read out
+of a file or a web page. Anything reachable from this machine is in scope — a
+`localhost` admin endpoint or a cloud metadata IP as much as a public docs site.
+
 ## Where things live
 
 | | |
 | --- | --- |
-| tools | `read_file`, `write_file`, `bash`, `search_docs` in `app/main.py` |
+| tools | `read_file`, `write_file`, `bash`, `search_docs`, `browse` in `app/main.py` |
 | registry | `TOOLS` — add a tool here and the loop picks it up |
 | loop | `main()`, one turn at a time via `_stream_turn()` |
 | knobs | `LLM_MODEL`, `NUM_CTX`, `MAX_TURNS`, `SYSTEM_PROMPT` near the top |
