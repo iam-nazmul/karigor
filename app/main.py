@@ -29,21 +29,27 @@ from langchain_ollama import ChatOllama
 # from dotenv import load_dotenv
 # load_dotenv()
 
-from langchain.messages import AIMessage, HumanMessage, SystemMessage
+from langchain.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain.agents import create_agent
+# from langchain.agents import create_agent
 from langchain.tools import tool
 
 
-SYSTEM_PROMPT = (
-    "You are a helpful assistant. Answer clearly and concisely. "
-    "Use the read_file tool whenever you need the contents of a file on disk; "
-    "never guess what a file contains."
+# SYSTEM_PROMPT = (
+#     "You are a helpful assistant. Answer clearly and concisely. "
+#     "Use the read_file tool whenever you need the contents of a file on disk; "
+#     "never guess what a file contains."
+# )
+
+SYSTEM_PROMPT =(
+    "user"
 )
 
-MAX_LINE_LENGTH = 2000
-DEFAULT_LIMIT = 2000
+MAX_LINE_LENGTH = 20000
+DEFAULT_LIMIT = 20000
+LLM_MODEL="gemma4:e2b"
+# LLM_MODEL="qwen3:8b"
 
 
 @tool
@@ -91,31 +97,53 @@ def read_file(path: str, offset: int = 1, limit: int = DEFAULT_LIMIT) -> str:
     return "\n".join(out)
 
 
+TOOLS = {t.name: t for t in [read_file]}
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("-p", required=True)
     # gemma3 has no tool-calling support in Ollama; use a tool-capable model.
-    p.add_argument("-m", "--model", default="qwen3:8b")
+    # p.add_argument("-m", "--model", default=LLM_MODEL)
     args = p.parse_args()
 
-    llm = ChatOllama(model=args.model)
+    # llm = ChatOllama(model=args.model)
+    llm = ChatOllama(model=LLM_MODEL)
 
-    agent = create_agent(
-        model=llm,
-        tools=[read_file],
-        system_prompt=SYSTEM_PROMPT,
-    )
+    # Advertise: the tool schema goes to the model with every request.
+    llm_with_tools = llm.bind_tools(list(TOOLS.values()))
 
-    stream = agent.stream_events(
-        {"messages": [{"role": "user", "content": args.p}]},
-        version="v3",
-    )
-    for kind, item in stream.interleave("messages", "tool_calls"):
-        if kind == "messages":
-            for token in item.text:
-                print(token, end="", flush=True)
-        elif kind == "tool_calls":
-            print(f"\n[{item.tool_name}({item.input})]", flush=True)
+    messages = [
+        SystemMessage(SYSTEM_PROMPT),
+        HumanMessage(args.p),
+    ]
+
+    ai_msg = llm_with_tools.invoke(messages)
+    messages.append(ai_msg)
+
+    if not ai_msg.tool_calls:
+        # The model answered directly; nothing to execute.
+        print(ai_msg.text)
+        return
+
+    # Execute: the model only *asks* for a call — we run it and hand back the result.
+    for call in ai_msg.tool_calls:
+        print(f"[{call['name']}({call['args']})]", flush=True)
+        tool = TOOLS.get(call["name"])
+        if tool is None:
+            messages.append(
+                ToolMessage(
+                    content=f"Error: unknown tool {call['name']}",
+                    tool_call_id=call["id"],
+                )
+            )
+            continue
+        # .invoke() on the whole tool_call returns a ToolMessage with the id set.
+        messages.append(tool.invoke(call))
+
+    # One more turn so the model can answer from the tool output.
+    for chunk in llm_with_tools.stream(messages):
+        print(chunk.text, end="", flush=True)
     print()
 
 

@@ -41,7 +41,7 @@ uv run python -m app.main -p "..."
 | flag | required | default | notes |
 | --- | --- | --- | --- |
 | `-p` | yes | — | the prompt |
-| `-m` / `--model` | no | `qwen3:8b` | any Ollama model **with tool support**; `gemma3:4b` runs but never calls `read_file` |
+<!--| `-m` / `--model` | no | `qwen3:8b` | any Ollama model **with tool support**; `gemma3:4b` runs but never calls `read_file` |-->
 
 ### Credentials
 
