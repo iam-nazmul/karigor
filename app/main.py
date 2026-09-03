@@ -20,6 +20,7 @@ for _noisy in (
 import httpx
 from bs4 import BeautifulSoup
 from ddgs import DDGS
+from pydantic import ValidationError
 
 # Any file type -> text: PDF, Office documents, email, epub, images. Local
 # partitioning, no API key; the format-specific extras live in pyproject.
@@ -64,14 +65,17 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain.tools import tool
 
 
-# SYSTEM_PROMPT = (
-#     "You are a helpful assistant. Answer clearly and concisely. "
-#     "Use the read_file tool whenever you need the contents of a file on disk; "
-#     "never guess what a file contains."
-# )
-
-SYSTEM_PROMPT =(
-    "user"
+SYSTEM_PROMPT = (
+    "You are a coding assistant working on the user's machine. Answer clearly "
+    "and concisely.\n\n"
+    "Do the work with the tools rather than describing it. Never say a file was "
+    "created, changed or run unless the matching tool call returned a result "
+    "saying so — a description of a write is not a write. Never guess what a "
+    "file contains: read it.\n\n"
+    "Creating or changing a file means calling write_file with both arguments, "
+    "file_path and content, where content is the complete text of the file. "
+    "If a tool returns an error, read it and try again — a bad argument can be "
+    "corrected on the next call."
 )
 
 MAX_LINE_LENGTH = 20000
@@ -125,6 +129,7 @@ LLM_MODEL="gemma4:e2b"
 # the model then has no room left to answer and returns empty text.
 NUM_CTX = 32768
 MAX_TURNS = 25
+LLM_RETRIES = 3
 
 
 def _is_document(path: str) -> bool:
@@ -589,20 +594,54 @@ TOOLS = {
 }
 
 
+def _signature(tool) -> str:
+    """The tool's arguments as a one-line signature, for error messages."""
+    schema = tool.tool_call_schema.model_json_schema()
+    required = set(schema.get("required", []))
+
+    parts = []
+    for name, spec in schema.get("properties", {}).items():
+        kind = spec.get("type", "any")
+        parts.append(f"{name}: {kind}" + ("" if name in required else " (optional)"))
+    return ", ".join(parts)
+
+
+def _format_validation_error(e: ValidationError) -> str:
+    """Pydantic's multi-line report, flattened to what the model has to fix."""
+    problems = []
+    for err in e.errors():
+        field = ".".join(str(p) for p in err["loc"]) or "argument"
+        problems.append(f"{field}: {err['msg']}")
+    return "; ".join(problems)
+
+
 def _stream_turn(llm, messages):
     """Run one assistant turn, printing text as it arrives.
 
     Returns the accumulated message. Summing the streamed chunks rebuilds
     the tool calls too, so the loop can stream and still see what to run.
     """
-    full = None
-    for chunk in llm.stream(messages):
-        if chunk.text:
-            print(chunk.text, end="", flush=True)
-        full = chunk if full is None else full + chunk
-    if full is not None and full.text:
-        print()
-    return full
+    # Ollama drops the connection when it is loading or evicting a model — a
+    # 7 GB model on CPU takes long enough that the first turn of a run is the
+    # one that gets cut off. Unretried, the whole run ends in a traceback with
+    # the work half done and nothing written.
+    for attempt in range(1, LLM_RETRIES + 1):
+        full = None
+        try:
+            for chunk in llm.stream(messages):
+                if chunk.text:
+                    print(chunk.text, end="", flush=True)
+                full = chunk if full is None else full + chunk
+        except httpx.HTTPError as e:
+            if attempt == LLM_RETRIES:
+                raise
+            print(f"\n[llm connection lost ({e}); retrying turn {attempt}/{LLM_RETRIES}]",
+                  file=sys.stderr, flush=True)
+            continue
+
+        if full is not None and full.text:
+            print()
+        return full
 
 
 def main():
@@ -627,7 +666,20 @@ def main():
     # tool. One pass only ever gets one step done — "read this file and fix the
     # bug" needs the model to see the read before it can write.
     for _ in range(MAX_TURNS):
-        ai_msg = _stream_turn(llm_with_tools, messages)
+        try:
+            ai_msg = _stream_turn(llm_with_tools, messages)
+        except httpx.HTTPError as e:
+            print(f"\nError: lost the connection to Ollama: {e}", file=sys.stderr)
+            print("Is `ollama serve` running, and does the model fit in memory?",
+                  file=sys.stderr)
+            sys.exit(1)
+
+        if ai_msg is None:
+            print("\nError: the model returned nothing. A context window too "
+                  "small for the tool results is the usual cause; NUM_CTX is "
+                  f"{NUM_CTX}.", file=sys.stderr)
+            sys.exit(1)
+
         messages.append(ai_msg)
 
         if not ai_msg.tool_calls:
@@ -640,15 +692,43 @@ def main():
             print(f"[{call['name']}({call['args']})]", flush=True)
             tool = TOOLS.get(call["name"])
             if tool is None:
+                known = ", ".join(sorted(TOOLS))
                 messages.append(
                     ToolMessage(
-                        content=f"Error: unknown tool {call['name']}",
+                        content=f"Error: unknown tool {call['name']}. Available: {known}",
                         tool_call_id=call["id"],
                     )
                 )
                 continue
-            # .invoke() on the whole tool_call returns a ToolMessage with the id set.
-            messages.append(tool.invoke(call))
+
+            try:
+                # .invoke() on the whole tool_call returns a ToolMessage with the id set.
+                messages.append(tool.invoke(call))
+            except ValidationError as e:
+                # The model picked the right tool and got its arguments wrong —
+                # a missing `content`, the old `path` name, a number where a
+                # string belongs. Uncaught, that ends the run with a traceback
+                # and nothing written. Handed back as a message with the schema
+                # in it, the model can fix the call on the next turn.
+                messages.append(
+                    ToolMessage(
+                        content=(
+                            f"Error: bad arguments for {call['name']}: "
+                            f"{_format_validation_error(e)}\n"
+                            f"{call['name']} takes: {_signature(tool)}"
+                        ),
+                        tool_call_id=call["id"],
+                    )
+                )
+            except Exception as e:
+                # A tool that raises anything else should not take the run with
+                # it either; the model can try another approach.
+                messages.append(
+                    ToolMessage(
+                        content=f"Error: {call['name']} failed: {type(e).__name__}: {e}",
+                        tool_call_id=call["id"],
+                    )
+                )
 
     # A model that keeps calling tools without concluding would otherwise spin
     # here forever, burning tokens and touching the filesystem each time.

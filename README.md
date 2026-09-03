@@ -131,8 +131,38 @@ for call in ai_msg.tool_calls:          # {'name', 'args', 'id'}
 Two details matter. Passing the **whole call** to `tool.invoke()` — not just
 `call["args"]` — returns a `ToolMessage` with `tool_call_id` already set to match
 the request, which is how the model pairs a result with the call it made when
-several run at once. And an unknown tool name gets an error `ToolMessage` rather
-than a crash, since the model chooses these names and can get one wrong.
+several run at once. (A hand-built dict also needs `"type": "tool_call"` in it,
+or LangChain reads the whole dict as the arguments.) And an unknown tool name
+gets an error `ToolMessage` rather than a crash, since the model chooses these
+names and can get one wrong.
+
+**Wrong arguments need the same treatment as a wrong name.** The model picks the
+right tool and then omits `content`, or uses the old `path` spelling, or sends a
+number where a string belongs. `tool.invoke()` raises `ValidationError` on each,
+and uncaught that ends the run with a traceback and nothing written — which looks
+exactly like "the write tool doesn't create files". Caught, it becomes a message
+the model can act on, with the schema attached so the retry has something to aim
+at:
+
+```python
+except ValidationError as e:
+    messages.append(ToolMessage(
+        content=(f"Error: bad arguments for {call['name']}: {_format_validation_error(e)}\n"
+                 f"{call['name']} takes: {_signature(tool)}"),
+        tool_call_id=call["id"],
+    ))
+```
+
+```
+[write_file({'file_path': '/tmp/out.txt'})]
+Error: bad arguments for write_file: content: Field required
+write_file takes: file_path: string, content: string
+[write_file({'file_path': '/tmp/out.txt', 'content': 'hi\n'})]
+Created /tmp/out.txt (1 lines, 3 chars)
+```
+
+The turn after an error is where the work actually gets done, so the loop has to
+still be running to reach it.
 
 ```
 $ uv run karigor -p "Use the read_file tool on README.md and quote its first line."
@@ -167,6 +197,21 @@ accumulated chunk still carries fully-formed `tool_calls`.
 `MAX_TURNS` caps the loop. Without it a model that keeps calling tools without
 ever concluding spins forever, burning tokens and touching the filesystem every
 iteration.
+
+The other way a run ends with nothing done is the connection dropping. Ollama
+disconnects while it loads or evicts a model — a 7 GB model on CPU takes long
+enough that the *first* turn is the one that gets cut off — and
+`httpx.RemoteProtocolError` mid-stream would otherwise surface as a traceback
+after the model had already announced what it was about to write. `_stream_turn`
+retries the turn `LLM_RETRIES` times, and a server that is genuinely unreachable
+exits with a message rather than a stack trace:
+
+```
+[llm connection lost (Server disconnected without sending a response.); retrying turn 1/3]
+...
+Error: lost the connection to Ollama: [Errno 111] Connection refused
+Is `ollama serve` running, and does the model fit in memory?
+```
 
 The result is a program that chains steps on its own:
 
@@ -360,6 +405,9 @@ them.
 | loop | `main()`, one turn at a time via `_stream_turn()` |
 | knobs | `LLM_MODEL`, `NUM_CTX`, `MAX_TURNS`, `SYSTEM_PROMPT` near the top |
 
-`SYSTEM_PROMPT` is worth attention: it is currently a placeholder, and a prompt
-that never tells the model to prefer reading a file over guessing its contents
-makes tool use noticeably less reliable.
+`SYSTEM_PROMPT` is worth attention. It was a placeholder — the literal string
+`"user"` — and a prompt that never tells the model to prefer a tool call over a
+description makes tool use noticeably less reliable: a small model will happily
+answer "I've created the file" without ever calling `write_file`. It now says to
+do the work with the tools, never to claim a file was written unless the call
+returned saying so, and to correct and retry a call the loop rejected.
