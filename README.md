@@ -107,7 +107,9 @@ convert_to_openai_tool(TOOLS["read_file"])
 #  'parameters': {'properties': {'file_path': ..., 'offset': ..., 'limit': ...}}}
 ```
 
-`read_file` returns lines numbered `cat -n` style so the model can refer to a
+`read_file` handles any file type — see [step 10](#10-read-any-file-type-and-whole-directories)
+for the document conversion layered on top of the text path described here. It
+returns lines numbered `cat -n` style so the model can refer to a
 line by number, truncates very long lines, and reports missing files, directories
 and past-the-end offsets as plain strings — an error the model can read and
 recover from beats an exception that kills the program.
@@ -196,7 +198,10 @@ Adding it to the program is one line — `TOOLS` is a name→tool registry, and 
 dispatch loop from step 4 picks up anything in it unchanged:
 
 ```python
-TOOLS = {t.name: t for t in [read_file, write_file, bash, search_docs, browse]}
+TOOLS = {
+    t.name: t
+    for t in [read_file, read_directory, write_file, bash, search_docs, browse]
+}
 ```
 
 ## 7. Implement the bash tool
@@ -283,11 +288,74 @@ It's a reserved domain for use in documentation examples, no permission needed.
 of a file or a web page. Anything reachable from this machine is in scope — a
 `localhost` admin endpoint or a cloud metadata IP as much as a public docs site.
 
+## 10. Read any file type, and whole directories
+
+`read_file` originally decoded bytes as UTF-8, which is fine for source code and
+useless for a PDF — `errors="replace"` turns one into pages of mojibake. Two
+loaders fix that:
+
+```python
+from langchain_unstructured import UnstructuredLoader
+from langchain_community.document_loaders import DirectoryLoader
+```
+
+`UnstructuredLoader` converts PDFs, Word/PowerPoint/Excel documents, email,
+epub and images to text locally — no API key, no `partition_via_api`. It returns
+one `Document` per element (title, paragraph, table, list item); joining them in
+order reproduces the document's flow.
+
+**`read_file` routes by content, not by name.** A file is sent through
+Unstructured when its extension is in `DOCUMENT_EXTS`, when its first bytes match
+`DOCUMENT_MAGIC` (`%PDF`, the `PK\x03\x04` zip container behind every OOXML file,
+the OLE2 container behind old `.doc`/`.xls`), or when it simply does not decode as
+UTF-8. So a `.docx` saved as `report.txt` still comes back as prose, and the model
+never has to check a format before reading:
+
+```
+$ uv run karigor -p "Read report.docx and tell me the revenue growth figure."
+[read_file({'file_path': '.../report.docx'})]
+The report states that revenue grew **12% in Q3**, driven by the pilot program.
+```
+
+Converted output is still line-numbered, but prefixed with
+`[.pdf converted to text by Unstructured]` — the numbering is over the extracted
+text, not the file on disk, and the model should not cite "line 12 of the PDF"
+as if it were a real line.
+
+**`read_directory` reads a whole tree in one call**, via `DirectoryLoader` with
+`UnstructuredLoader` as its `loader_cls` and `silent_errors=True`, so one
+unreadable file does not sink the folder. Results are grouped back per source
+file, since the loader returns a flat list of elements from every file at once.
+
+The cap matters more than the loading. `**/*` inside this repo matches ~62,000
+files once `.venv` and `.git` are counted, and `Path.match` compares from the
+right, so directory patterns like `**/.git/**` cannot be excluded. So the tool
+counts matches first and refuses over `MAX_DIR_FILES`, before any parsing
+happens:
+
+```
+Error: '**/*' matches 62752 files in /home/nazmul/Desktop/karigor, over the
+50-file cap. Narrow the glob (e.g. '*.md', '**/*.pdf') or point at a subdirectory.
+```
+
+Per-file output is capped at `MAX_FILE_CHARS` and the whole call at
+`MAX_DIR_CHARS`; `read_directory` is for surveying a folder, `read_file` for
+reading one thing in full.
+
+Two operational notes. The format extras are pinned in `pyproject.toml`
+(`unstructured[docx,pptx,xlsx,md,pdf]`) — a format outside them returns
+`needs an Unstructured extra that is not installed` rather than crashing, and
+OCR for scanned PDFs and images additionally needs the `tesseract` binary.
+Unstructured also downloads a spaCy model on first use and its dependencies
+enable root logging, which is why `app/main.py` quiets a list of loggers
+(including `httpx`, which otherwise narrates every Ollama call) before importing
+them.
+
 ## Where things live
 
 | | |
 | --- | --- |
-| tools | `read_file`, `write_file`, `bash`, `search_docs`, `browse` in `app/main.py` |
+| tools | `read_file`, `read_directory`, `write_file`, `bash`, `search_docs`, `browse` in `app/main.py` |
 | registry | `TOOLS` — add a tool here and the loop picks it up |
 | loop | `main()`, one turn at a time via `_stream_turn()` |
 | knobs | `LLM_MODEL`, `NUM_CTX`, `MAX_TURNS`, `SYSTEM_PROMPT` near the top |

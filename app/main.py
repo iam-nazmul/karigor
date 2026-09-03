@@ -1,11 +1,34 @@
 import os
 import sys
 import argparse
+import logging
 import subprocess
+import warnings
+from pathlib import Path
+
+# Unstructured and its dependencies log INFO chatter on first use — font
+# managers, thread counts, a one-off spaCy model download — which would
+# interleave with the model's streamed answer. Importing them also turns on
+# root logging, which is what makes httpx narrate every Ollama call, so those
+# loggers are quieted here too. Set before importing them.
+for _noisy in (
+    "unstructured", "unstructured_client", "numexpr", "matplotlib",
+    "pikepdf", "pdfminer", "PIL", "httpx", "httpcore",
+):
+    logging.getLogger(_noisy).setLevel(logging.ERROR)
 
 import httpx
 from bs4 import BeautifulSoup
 from ddgs import DDGS
+
+# Any file type -> text: PDF, Office documents, email, epub, images. Local
+# partitioning, no API key; the format-specific extras live in pyproject.
+from langchain_unstructured import UnstructuredLoader
+
+# langchain-community warns on import that it is being sunset. It is still the
+# only home for DirectoryLoader, and the notice on every CLI run is noise.
+warnings.filterwarnings("ignore", message=".*langchain-community.*sunset.*")
+from langchain_community.document_loaders import DirectoryLoader
 
 # https://docs.langchain.com/oss/python/integrations/chat/
 from langchain_ollama import ChatOllama
@@ -56,6 +79,33 @@ DEFAULT_LIMIT = 20000
 MAX_OUTPUT_CHARS = 30000
 DEFAULT_TIMEOUT = 60
 
+# Formats that are not text on disk, so read_file routes them through
+# Unstructured instead of decoding the bytes. Anything else that turns out to
+# be binary is caught by sniffing, so this list only has to cover the common
+# document types by name.
+DOCUMENT_EXTS = {
+    ".pdf", ".docx", ".doc", ".odt", ".rtf",
+    ".pptx", ".ppt", ".odp",
+    ".xlsx", ".xls", ".ods",
+    ".epub", ".msg", ".eml", ".heic",
+    ".png", ".jpg", ".jpeg", ".tiff", ".bmp",
+}
+
+# Checked when the extension says nothing: PDF, the zip container behind every
+# OOXML document, and the OLE2 container behind the older .doc/.xls/.ppt.
+DOCUMENT_MAGIC = (b"%PDF", b"PK\x03\x04", b"\xd0\xcf\x11\xe0")
+
+# read_directory reads whole trees, so it needs tighter caps than read_file:
+# one runaway call otherwise fills the context window with a virtualenv.
+MAX_DIR_FILES = 50
+MAX_FILE_CHARS = 4000
+MAX_DIR_CHARS = 40000
+DIR_GLOB = "**/*"
+# Path.match compares from the right, so directory patterns like "**/.git/**"
+# do not work here — these are file patterns only. Trees too big to read are
+# caught by MAX_DIR_FILES instead.
+DIR_EXCLUDE = ("*.lock", "*.pyc", "*.so", "*.bin", "*.pack", "*.woff2")
+
 # Web search backing search_docs. No API key — DuckDuckGo via ddgs.
 SEARCH_RESULTS = 5
 FETCH_PAGES = 2
@@ -77,11 +127,63 @@ NUM_CTX = 32768
 MAX_TURNS = 25
 
 
+def _is_document(path: str) -> bool:
+    """True if the file should go through Unstructured rather than be decoded.
+
+    read_file decodes with errors="replace", so without this a PDF comes back as
+    pages of mojibake. Extension first, then the file's own bytes — a document
+    saved under the wrong name is still a document.
+    """
+    if os.path.splitext(path)[1].lower() in DOCUMENT_EXTS:
+        return True
+
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4096)
+    except OSError:
+        return False
+
+    if head.startswith(DOCUMENT_MAGIC):
+        return True
+    if b"\x00" in head:
+        return True
+    try:
+        # Drop the last few bytes: a multi-byte character split by the 4096-byte
+        # cut is not evidence of a binary file.
+        head[:-3].decode("utf-8")
+    except UnicodeDecodeError:
+        return True
+    return False
+
+
+def _unstructured_text(path: str) -> tuple[str, str | None]:
+    """Convert any supported document to text. Returns (text, error)."""
+    try:
+        # One Document per element (title, paragraph, table, list item);
+        # joining them back in order reads as the document did.
+        docs = UnstructuredLoader(file_path=path).load()
+    except ImportError as e:
+        return "", (
+            f"Error: {os.path.basename(path)} needs an Unstructured extra that is "
+            f"not installed: {e}"
+        )
+    except Exception as e:
+        # Unstructured raises format-specific errors from a dozen underlying
+        # libraries; the model can act on the message, a traceback ends the run.
+        return "", f"Error: could not extract text from {path}: {type(e).__name__}: {e}"
+
+    return "\n".join(d.page_content.strip() for d in docs if d.page_content.strip()), None
+
+
 @tool
 def read_file(file_path: str, offset: int = 1, limit: int = DEFAULT_LIMIT) -> str:
-    """Read a text file from the local filesystem.
+    """Read a file of any type from the local filesystem.
 
-    Returns the file contents with line numbers, in `cat -n` format.
+    Text files are read as they are. PDFs, Word/PowerPoint/Excel documents,
+    email, epub and images are converted to text with Unstructured first, so
+    this tool works on any file — no need to check the format beforehand.
+
+    Returns the contents with line numbers, in `cat -n` format.
 
     Args:
         file_path: Absolute or relative path to the file to read.
@@ -93,13 +195,27 @@ def read_file(file_path: str, offset: int = 1, limit: int = DEFAULT_LIMIT) -> st
     if not os.path.exists(target):
         return f"Error: file not found: {target}"
     if os.path.isdir(target):
-        return f"Error: {target} is a directory, not a file"
+        return f"Error: {target} is a directory, not a file. Use read_directory."
 
-    try:
-        with open(target, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-    except OSError as e:
-        return f"Error: could not read {target}: {e}"
+    note = ""
+    ext = os.path.splitext(target)[1].lower()
+
+    if _is_document(target):
+        text, err = _unstructured_text(target)
+        if err:
+            return err
+        if not text:
+            return f"{target} converted to no text ({ext or 'no extension'})"
+        # Line numbers are over the extracted text, not the file on disk; say so
+        # rather than letting the model cite "line 12 of the PDF".
+        note = f"[{ext or 'binary'} converted to text by Unstructured]\n"
+        lines = text.splitlines(keepends=True)
+    else:
+        try:
+            with open(target, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+        except OSError as e:
+            return f"Error: could not read {target}: {e}"
 
     if not lines:
         return f"{target} is empty"
@@ -119,7 +235,7 @@ def read_file(file_path: str, offset: int = 1, limit: int = DEFAULT_LIMIT) -> st
     if end < len(lines):
         out.append(f"... [truncated, {len(lines) - end} more lines]")
 
-    return "\n".join(out)
+    return note + "\n".join(out)
 
 
 @tool
@@ -156,6 +272,98 @@ def write_file(file_path: str, content: str) -> str:
 
     verb = "Updated" if existed else "Created"
     return f"{verb} {target} ({len(content.splitlines())} lines, {len(content)} chars)"
+
+
+@tool
+def read_directory(
+    dir_path: str,
+    glob: str = DIR_GLOB,
+    max_files: int = MAX_DIR_FILES,
+) -> str:
+    """Read every file in a directory, of any type, in one call.
+
+    Loads the whole tree — text, PDFs, Office documents, email — and returns
+    each file's text under its path. Use this to get the lay of a folder you
+    have not seen; use read_file when you know which file you want, since this
+    truncates each file to a preview rather than returning it in full.
+
+    Args:
+        dir_path: Directory to read. Searched recursively.
+        glob: Which files to load, e.g. "**/*.pdf" for just the PDFs or
+            "*.md" for Markdown in the top level only. Defaults to everything.
+        max_files: Refuse to load more than this many files. Narrow the glob
+            or point at a subdirectory if a tree comes back over the cap.
+    """
+    target = os.path.abspath(os.path.expanduser(dir_path))
+
+    if not os.path.exists(target):
+        return f"Error: directory not found: {target}"
+    if not os.path.isdir(target):
+        return f"Error: {target} is a file, not a directory. Use read_file."
+
+    # Count first, with DirectoryLoader's own matching rules. Loading a tree is
+    # the expensive half — a virtualenv or a .git directory would be thousands
+    # of files parsed one by one before anything came back.
+    matches = [
+        p for p in Path(target).glob(glob)
+        if p.is_file() and not any(p.match(x) for x in DIR_EXCLUDE)
+    ]
+    if not matches:
+        return f"No files match {glob!r} in {target}"
+    if len(matches) > max_files:
+        return (
+            f"Error: {glob!r} matches {len(matches)} files in {target}, over the "
+            f"{max_files}-file cap. Narrow the glob (e.g. '*.md', '**/*.pdf') or "
+            "point at a subdirectory."
+        )
+
+    loader = DirectoryLoader(
+        target,
+        glob=glob,
+        loader_cls=UnstructuredLoader,
+        exclude=DIR_EXCLUDE,
+        # One unreadable file in a folder should not fail the whole read.
+        silent_errors=True,
+        use_multithreading=True,
+    )
+
+    try:
+        docs = loader.load()
+    except Exception as e:
+        return f"Error: could not read {target}: {type(e).__name__}: {e}"
+
+    # One Document per element, so group them back into one text per file.
+    by_file: dict[str, list[str]] = {}
+    for d in docs:
+        source = d.metadata.get("source", "unknown")
+        if d.page_content.strip():
+            by_file.setdefault(source, []).append(d.page_content.strip())
+
+    if not by_file:
+        return f"Loaded {len(matches)} files from {target}, but none yielded text"
+
+    out = [f"{target} — {len(by_file)} of {len(matches)} files yielded text ({glob})"]
+    total = 0
+    for source in sorted(by_file):
+        body = "\n".join(by_file[source])
+        if len(body) > MAX_FILE_CHARS:
+            body = body[:MAX_FILE_CHARS] + "\n... [truncated, read_file for the rest]"
+
+        rel = os.path.relpath(source, target)
+        out.append(f"\n=== {rel} ({len(body)} chars) ===\n{body}")
+
+        total += len(body)
+        if total > MAX_DIR_CHARS:
+            out.append(f"\n... [stopped at {MAX_DIR_CHARS} chars, {len(by_file)} files total]")
+            break
+
+    skipped = sorted(set(os.path.abspath(str(p)) for p in matches) - set(by_file))
+    if skipped:
+        names = ", ".join(os.path.relpath(s, target) for s in skipped[:10])
+        more = f" (+{len(skipped) - 10} more)" if len(skipped) > 10 else ""
+        out.append(f"\nNo text extracted from: {names}{more}")
+
+    return "\n".join(out)
 
 
 @tool
@@ -375,7 +583,10 @@ def search_docs(library: str, query: str, version: str = "") -> str:
     return "\n".join(out)
 
 
-TOOLS = {t.name: t for t in [read_file, write_file, bash, search_docs, browse]}
+TOOLS = {
+    t.name: t
+    for t in [read_file, read_directory, write_file, bash, search_docs, browse]
+}
 
 
 def _stream_turn(llm, messages):
