@@ -3,6 +3,8 @@ import sys
 import argparse
 import subprocess
 
+import httpx
+
 # https://docs.langchain.com/oss/python/integrations/chat/
 from langchain_ollama import ChatOllama
 
@@ -27,8 +29,9 @@ from langchain_ollama import ChatOllama
 # from langchain_amazon_nova import ChatAmazonNova
 
 
-# from dotenv import load_dotenv
-# load_dotenv()
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from langchain.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate
@@ -51,8 +54,15 @@ MAX_LINE_LENGTH = 20000
 DEFAULT_LIMIT = 20000
 MAX_OUTPUT_CHARS = 30000
 DEFAULT_TIMEOUT = 60
+
+# https://context7.com — up-to-date docs pulled from each library's own source.
+CONTEXT7_BASE_URL = "https://context7.com/api/v1"
+DEFAULT_DOC_TOKENS = 3000
 LLM_MODEL="gemma4:e2b"
 # LLM_MODEL="qwen3:8b"
+# Ollama defaults to a 4096-token context, which a single tool result fills —
+# the model then has no room left to answer and returns empty text.
+NUM_CTX = 32768
 
 
 @tool
@@ -176,7 +186,100 @@ def bash(command: str, timeout: int = DEFAULT_TIMEOUT) -> str:
     return output
 
 
-TOOLS = {t.name: t for t in [read_file, write_file, bash]}
+def _slug(name: str) -> str:
+    """Lowercase, alphanumerics only — so "Next.js" and "nextjs" compare equal."""
+    return "".join(ch for ch in name.lower() if ch.isalnum())
+
+
+def _context7_get(path: str, params: dict, accept_text: bool = False):
+    """GET against the Context7 API. Returns parsed JSON, text, or an error string."""
+    key = os.environ.get("CONTEXT7_API_KEY")
+    if not key:
+        return "Error: CONTEXT7_API_KEY is not set (see .env.example)"
+
+    try:
+        r = httpx.get(
+            f"{CONTEXT7_BASE_URL}{path}",
+            params=params,
+            headers={"Authorization": f"Bearer {key}"},
+            timeout=30.0,
+        )
+        r.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        return f"Error: Context7 returned {e.response.status_code} for {path}"
+    except httpx.HTTPError as e:
+        return f"Error: could not reach Context7: {e}"
+
+    return r.text if accept_text else r.json()
+
+
+@tool
+def search_docs(library: str, query: str, version: str = "") -> str:
+    """Look up current documentation and code examples for a library or framework.
+
+    Fetches docs straight from the library's own source, so the answer
+    reflects the released version rather than model memory. Use this for
+    any question about a library, framework, SDK, or CLI tool — API syntax,
+    configuration, setup, or migration.
+
+    Args:
+        library: Library name, e.g. "LangChain", "Next.js", "Prisma".
+        query: What to look up, as a phrase — "how to define a custom tool",
+            not a single word. Keep it to one concept per call.
+        version: Optional version to pin, e.g. "v14.3.0". Omit for latest.
+    """
+    found = _context7_get("/search", {"query": library})
+    if isinstance(found, str):
+        return found
+
+    results = found.get("results") or []
+    if not results:
+        return f"No library named {library!r} found on Context7"
+
+    # Search is fuzzy and always answers, so a nonsense name still comes back
+    # with something unrelated. Keep only titles that actually match the name
+    # asked for, then let quality decide between them — the raw relevance
+    # score is not comparable across queries.
+    wanted = _slug(library)
+    titles = [(r, _slug(r.get("title", ""))) for r in results]
+    # Exact title first: a prefix match alone pulls in "LangChain NVIDIA" for
+    # "LangChain", and those sub-projects often outrank the real docs.
+    matches = [r for r, t in titles if t == wanted]
+    if not matches:
+        matches = [r for r, t in titles if t.startswith(wanted)]
+    if not matches:
+        close = ", ".join(f"{r.get('title')} ({r['id']})" for r in results[:3])
+        return f"No confident match for {library!r} on Context7. Closest: {close}"
+
+    best = max(
+        matches,
+        key=lambda r: (r.get("benchmarkScore") or 0, r.get("trustScore") or 0),
+    )
+    library_id = best["id"]
+
+    if version:
+        available = [v for v in best.get("versions") or [] if version in v]
+        if not available:
+            return (
+                f"Version {version!r} is not available for {library_id}. "
+                f"Known versions: {', '.join(best.get('versions') or []) or 'none'}"
+            )
+        library_id = f"{library_id}/{available[0]}"
+
+    docs = _context7_get(
+        f"/{library_id.lstrip('/')}",
+        {"type": "txt", "topic": query, "tokens": DEFAULT_DOC_TOKENS},
+        accept_text=True,
+    )
+    if docs.startswith("Error:"):
+        return docs
+    if not docs.strip():
+        return f"No documentation found in {library_id} for {query!r}"
+
+    return f"Docs for {best.get('title', library)} ({library_id}):\n\n{docs.strip()}"
+
+
+TOOLS = {t.name: t for t in [read_file, write_file, bash, search_docs]}
 
 
 def main():
@@ -187,7 +290,7 @@ def main():
     args = p.parse_args()
 
     # llm = ChatOllama(model=args.model)
-    llm = ChatOllama(model=LLM_MODEL)
+    llm = ChatOllama(model=LLM_MODEL, num_ctx=NUM_CTX)
 
     # Advertise: the tool schema goes to the model with every request.
     llm_with_tools = llm.bind_tools(list(TOOLS.values()))
