@@ -97,7 +97,43 @@ def read_file(path: str, offset: int = 1, limit: int = DEFAULT_LIMIT) -> str:
     return "\n".join(out)
 
 
-TOOLS = {t.name: t for t in [read_file]}
+@tool
+def write_file(path: str, content: str) -> str:
+    """Write text to a file on the local filesystem.
+
+    Creates the file if it does not exist and overwrites it if it does.
+    Missing parent directories are created. Prefer reading a file first
+    before overwriting it.
+
+    Args:
+        path: Absolute or relative path to the file to write.
+        content: The full text to write to the file.
+    """
+    target = os.path.abspath(os.path.expanduser(path))
+
+    if os.path.isdir(target):
+        return f"Error: {target} is a directory, not a file"
+
+    existed = os.path.exists(target)
+
+    parent = os.path.dirname(target)
+    if parent and not os.path.isdir(parent):
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as e:
+            return f"Error: could not create directory {parent}: {e}"
+
+    try:
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(content)
+    except OSError as e:
+        return f"Error: could not write {target}: {e}"
+
+    verb = "Updated" if existed else "Created"
+    return f"{verb} {target} ({len(content.splitlines())} lines, {len(content)} chars)"
+
+
+TOOLS = {t.name: t for t in [read_file, write_file]}
 
 
 def main():
