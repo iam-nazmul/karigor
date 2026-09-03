@@ -107,7 +107,9 @@ convert_to_openai_tool(TOOLS["read_file"])
 #  'parameters': {'properties': {'file_path': ..., 'offset': ..., 'limit': ...}}}
 ```
 
-`read_file` returns lines numbered `cat -n` style so the model can refer to a
+`read_file` handles any file type — see [step 10](#10-read-any-file-type-and-whole-directories)
+for the document conversion layered on top of the text path described here. It
+returns lines numbered `cat -n` style so the model can refer to a
 line by number, truncates very long lines, and reports missing files, directories
 and past-the-end offsets as plain strings — an error the model can read and
 recover from beats an exception that kills the program.
@@ -129,8 +131,38 @@ for call in ai_msg.tool_calls:          # {'name', 'args', 'id'}
 Two details matter. Passing the **whole call** to `tool.invoke()` — not just
 `call["args"]` — returns a `ToolMessage` with `tool_call_id` already set to match
 the request, which is how the model pairs a result with the call it made when
-several run at once. And an unknown tool name gets an error `ToolMessage` rather
-than a crash, since the model chooses these names and can get one wrong.
+several run at once. (A hand-built dict also needs `"type": "tool_call"` in it,
+or LangChain reads the whole dict as the arguments.) And an unknown tool name
+gets an error `ToolMessage` rather than a crash, since the model chooses these
+names and can get one wrong.
+
+**Wrong arguments need the same treatment as a wrong name.** The model picks the
+right tool and then omits `content`, or uses the old `path` spelling, or sends a
+number where a string belongs. `tool.invoke()` raises `ValidationError` on each,
+and uncaught that ends the run with a traceback and nothing written — which looks
+exactly like "the write tool doesn't create files". Caught, it becomes a message
+the model can act on, with the schema attached so the retry has something to aim
+at:
+
+```python
+except ValidationError as e:
+    messages.append(ToolMessage(
+        content=(f"Error: bad arguments for {call['name']}: {_format_validation_error(e)}\n"
+                 f"{call['name']} takes: {_signature(tool)}"),
+        tool_call_id=call["id"],
+    ))
+```
+
+```
+[write_file({'file_path': '/tmp/out.txt'})]
+Error: bad arguments for write_file: content: Field required
+write_file takes: file_path: string, content: string
+[write_file({'file_path': '/tmp/out.txt', 'content': 'hi\n'})]
+Created /tmp/out.txt (1 lines, 3 chars)
+```
+
+The turn after an error is where the work actually gets done, so the loop has to
+still be running to reach it.
 
 ```
 $ uv run karigor -p "Use the read_file tool on README.md and quote its first line."
@@ -166,6 +198,21 @@ accumulated chunk still carries fully-formed `tool_calls`.
 ever concluding spins forever, burning tokens and touching the filesystem every
 iteration.
 
+The other way a run ends with nothing done is the connection dropping. Ollama
+disconnects while it loads or evicts a model — a 7 GB model on CPU takes long
+enough that the *first* turn is the one that gets cut off — and
+`httpx.RemoteProtocolError` mid-stream would otherwise surface as a traceback
+after the model had already announced what it was about to write. `_stream_turn`
+retries the turn `LLM_RETRIES` times, and a server that is genuinely unreachable
+exits with a message rather than a stack trace:
+
+```
+[llm connection lost (Server disconnected without sending a response.); retrying turn 1/3]
+...
+Error: lost the connection to Ollama: [Errno 111] Connection refused
+Is `ollama serve` running, and does the model fit in memory?
+```
+
 The result is a program that chains steps on its own:
 
 ```
@@ -196,7 +243,10 @@ Adding it to the program is one line — `TOOLS` is a name→tool registry, and 
 dispatch loop from step 4 picks up anything in it unchanged:
 
 ```python
-TOOLS = {t.name: t for t in [read_file, write_file, bash, search_docs]}
+TOOLS = {
+    t.name: t
+    for t in [read_file, read_directory, write_file, bash, search_docs, browse]
+}
 ```
 
 ## 7. Implement the bash tool
@@ -244,15 +294,120 @@ Two limits worth knowing: `version` biases the search but cannot pin it, and web
 search always answers — a misspelled library name returns something confident and
 unrelated rather than an error.
 
+## 9. Implement the browse tool
+
+`search_docs` finds pages; `browse` reads one you already have the address for —
+a release-note page, a GitHub issue, a raw file, a JSON endpoint, or a link that
+came back from a search:
+
+```python
+@tool
+def browse(url: str, offset: int = 0, limit: int = MAX_BROWSE_CHARS) -> str:
+    """Fetch a URL over the internet and return its content as text. ..."""
+```
+
+The HTML extraction is the same code `search_docs` uses — `_fetch_text` was split
+into `_get` (fetch, with HTTP errors returned as strings) and `_extract_text`
+(soup to blocks), and both tools compose them. What `browse` adds is the handling
+a single named URL needs:
+
+- **Content types.** HTML goes through the extractor; JSON, plain text, XML, CSV
+  and friends are returned verbatim, since running a JSON body through an HTML
+  parser yields nothing. Anything else — an image, a tarball — reports its type
+  and size instead of dumping bytes into the context window.
+- **Paging.** A page over `MAX_BROWSE_CHARS` is cut with
+  `continue with offset=N`, so a long document is readable across calls rather
+  than silently ending mid-sentence.
+- **Scheme check.** `http`/`https` only. A bare domain gets `https://` prepended;
+  `file://` is refused, because that is `read_file`'s job.
+- **Empty pages.** A client-rendered site extracts to nothing, which reads as "the
+  page is empty" — it says the content is JavaScript-rendered instead.
+
+```
+$ uv run karigor -p "Browse https://example.com and tell me what that domain is for."
+[browse({'url': 'https://example.com'})]
+It's a reserved domain for use in documentation examples, no permission needed.
+```
+
+`browse` fetches whatever URL the model asks for, including addresses it read out
+of a file or a web page. Anything reachable from this machine is in scope — a
+`localhost` admin endpoint or a cloud metadata IP as much as a public docs site.
+
+## 10. Read any file type, and whole directories
+
+`read_file` originally decoded bytes as UTF-8, which is fine for source code and
+useless for a PDF — `errors="replace"` turns one into pages of mojibake. Two
+loaders fix that:
+
+```python
+from langchain_unstructured import UnstructuredLoader
+from langchain_community.document_loaders import DirectoryLoader
+```
+
+`UnstructuredLoader` converts PDFs, Word/PowerPoint/Excel documents, email,
+epub and images to text locally — no API key, no `partition_via_api`. It returns
+one `Document` per element (title, paragraph, table, list item); joining them in
+order reproduces the document's flow.
+
+**`read_file` routes by content, not by name.** A file is sent through
+Unstructured when its extension is in `DOCUMENT_EXTS`, when its first bytes match
+`DOCUMENT_MAGIC` (`%PDF`, the `PK\x03\x04` zip container behind every OOXML file,
+the OLE2 container behind old `.doc`/`.xls`), or when it simply does not decode as
+UTF-8. So a `.docx` saved as `report.txt` still comes back as prose, and the model
+never has to check a format before reading:
+
+```
+$ uv run karigor -p "Read report.docx and tell me the revenue growth figure."
+[read_file({'file_path': '.../report.docx'})]
+The report states that revenue grew **12% in Q3**, driven by the pilot program.
+```
+
+Converted output is still line-numbered, but prefixed with
+`[.pdf converted to text by Unstructured]` — the numbering is over the extracted
+text, not the file on disk, and the model should not cite "line 12 of the PDF"
+as if it were a real line.
+
+**`read_directory` reads a whole tree in one call**, via `DirectoryLoader` with
+`UnstructuredLoader` as its `loader_cls` and `silent_errors=True`, so one
+unreadable file does not sink the folder. Results are grouped back per source
+file, since the loader returns a flat list of elements from every file at once.
+
+The cap matters more than the loading. `**/*` inside this repo matches ~62,000
+files once `.venv` and `.git` are counted, and `Path.match` compares from the
+right, so directory patterns like `**/.git/**` cannot be excluded. So the tool
+counts matches first and refuses over `MAX_DIR_FILES`, before any parsing
+happens:
+
+```
+Error: '**/*' matches 62752 files in /home/nazmul/Desktop/karigor, over the
+50-file cap. Narrow the glob (e.g. '*.md', '**/*.pdf') or point at a subdirectory.
+```
+
+Per-file output is capped at `MAX_FILE_CHARS` and the whole call at
+`MAX_DIR_CHARS`; `read_directory` is for surveying a folder, `read_file` for
+reading one thing in full.
+
+Two operational notes. The format extras are pinned in `pyproject.toml`
+(`unstructured[docx,pptx,xlsx,md,pdf]`) — a format outside them returns
+`needs an Unstructured extra that is not installed` rather than crashing, and
+OCR for scanned PDFs and images additionally needs the `tesseract` binary.
+Unstructured also downloads a spaCy model on first use and its dependencies
+enable root logging, which is why `app/main.py` quiets a list of loggers
+(including `httpx`, which otherwise narrates every Ollama call) before importing
+them.
+
 ## Where things live
 
 | | |
 | --- | --- |
-| tools | `read_file`, `write_file`, `bash`, `search_docs` in `app/main.py` |
+| tools | `read_file`, `read_directory`, `write_file`, `bash`, `search_docs`, `browse` in `app/main.py` |
 | registry | `TOOLS` — add a tool here and the loop picks it up |
 | loop | `main()`, one turn at a time via `_stream_turn()` |
 | knobs | `LLM_MODEL`, `NUM_CTX`, `MAX_TURNS`, `SYSTEM_PROMPT` near the top |
 
-`SYSTEM_PROMPT` is worth attention: it is currently a placeholder, and a prompt
-that never tells the model to prefer reading a file over guessing its contents
-makes tool use noticeably less reliable.
+`SYSTEM_PROMPT` is worth attention. It was a placeholder — the literal string
+`"user"` — and a prompt that never tells the model to prefer a tool call over a
+description makes tool use noticeably less reliable: a small model will happily
+answer "I've created the file" without ever calling `write_file`. It now says to
+do the work with the tools, never to claim a file was written unless the call
+returned saying so, and to correct and retry a call the loop rejected.
