@@ -72,17 +72,17 @@ MAX_TURNS = 25
 
 
 @tool
-def read_file(path: str, offset: int = 1, limit: int = DEFAULT_LIMIT) -> str:
+def read_file(file_path: str, offset: int = 1, limit: int = DEFAULT_LIMIT) -> str:
     """Read a text file from the local filesystem.
 
     Returns the file contents with line numbers, in `cat -n` format.
 
     Args:
-        path: Absolute or relative path to the file to read.
+        file_path: Absolute or relative path to the file to read.
         offset: 1-indexed line number to start reading from.
         limit: Maximum number of lines to return.
     """
-    target = os.path.abspath(os.path.expanduser(path))
+    target = os.path.abspath(os.path.expanduser(file_path))
 
     if not os.path.exists(target):
         return f"Error: file not found: {target}"
@@ -117,7 +117,7 @@ def read_file(path: str, offset: int = 1, limit: int = DEFAULT_LIMIT) -> str:
 
 
 @tool
-def write_file(path: str, content: str) -> str:
+def write_file(file_path: str, content: str) -> str:
     """Write text to a file on the local filesystem.
 
     Creates the file if it does not exist and overwrites it if it does.
@@ -125,10 +125,10 @@ def write_file(path: str, content: str) -> str:
     before overwriting it.
 
     Args:
-        path: Absolute or relative path to the file to write.
+        file_path: Absolute or relative path to the file to write.
         content: The full text to write to the file.
     """
-    target = os.path.abspath(os.path.expanduser(path))
+    target = os.path.abspath(os.path.expanduser(file_path))
 
     if os.path.isdir(target):
         return f"Error: {target} is a directory, not a file"
