@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import subprocess
 
 # https://docs.langchain.com/oss/python/integrations/chat/
 from langchain_ollama import ChatOllama
@@ -48,6 +49,8 @@ SYSTEM_PROMPT =(
 
 MAX_LINE_LENGTH = 20000
 DEFAULT_LIMIT = 20000
+MAX_OUTPUT_CHARS = 30000
+DEFAULT_TIMEOUT = 60
 LLM_MODEL="gemma4:e2b"
 # LLM_MODEL="qwen3:8b"
 
@@ -133,7 +136,47 @@ def write_file(path: str, content: str) -> str:
     return f"{verb} {target} ({len(content.splitlines())} lines, {len(content)} chars)"
 
 
-TOOLS = {t.name: t for t in [read_file, write_file]}
+@tool
+def bash(command: str, timeout: int = DEFAULT_TIMEOUT) -> str:
+    """Run a shell command and return its output.
+
+    The command runs through bash in the current working directory.
+    stdout and stderr are captured together. Use this for things the
+    other tools cannot do: listing directories, running tests, git.
+
+    Args:
+        command: The shell command to run.
+        timeout: Seconds to wait before killing the command.
+    """
+    try:
+        proc = subprocess.run(
+            command,
+            shell=True,
+            executable="/bin/bash",
+            capture_output=True,
+            text=True,
+            timeout=max(timeout, 1),
+        )
+    except subprocess.TimeoutExpired:
+        return f"Error: command timed out after {timeout}s: {command}"
+    except OSError as e:
+        return f"Error: could not run command: {e}"
+
+    output = (proc.stdout or "") + (proc.stderr or "")
+    output = output.strip()
+
+    if len(output) > MAX_OUTPUT_CHARS:
+        dropped = len(output) - MAX_OUTPUT_CHARS
+        output = output[:MAX_OUTPUT_CHARS] + f"\n... [truncated, {dropped} more chars]"
+
+    if not output:
+        return f"(no output, exit code {proc.returncode})"
+    if proc.returncode != 0:
+        return f"exit code {proc.returncode}\n{output}"
+    return output
+
+
+TOOLS = {t.name: t for t in [read_file, write_file, bash]}
 
 
 def main():
