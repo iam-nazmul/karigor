@@ -13,7 +13,8 @@ Along the way, you'll learn about LLM APIs, tool calling, agent loops, and how t
 - A tool-calling model pulled:
 
   ```bash
-  ollama pull qwen3:8b
+  ollama pull gemma4:e2b
+  #ollama pull qwen3:8b
   ```
 
 ### Install
